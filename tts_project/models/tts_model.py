@@ -532,6 +532,145 @@ def create_model(config: Dict) -> CustomTTSModel:
     return CustomTTSModel(config)
 
 
+def get_hardware_optimized_config(hardware: str = 'auto') -> Dict:
+    """
+    Returns model configuration optimized for specific hardware.
+    
+    Args:
+        hardware: Hardware type - 'cpu', 'low_end_gpu', 'mid_gpu', 'high_gpu', or 'auto'
+        
+    Returns:
+        Dictionary with optimized model parameters
+    """
+    import torch
+    
+    configs = {
+        'cpu': {
+            'model': {
+                'text_encoder': {
+                    'vocab_size': 512,
+                    'embedding_dim': 128,
+                    'max_seq_len': 500,
+                    'num_layers': 2,
+                    'num_heads': 2,
+                    'ff_dim': 512,
+                    'dropout': 0.1
+                },
+                'acoustic_decoder': {
+                    'in_features': 128,
+                    'num_layers': 2,
+                    'num_heads': 2,
+                    'ff_dim': 512,
+                    'out_features': 80,
+                    'dropout': 0.1
+                },
+                'duration_predictor': {'in_features': 128, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5},
+                'pitch_predictor': {'in_features': 128, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5},
+                'energy_predictor': {'in_features': 128, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5}
+            },
+            'training': {'batch_size': 4, 'gradient_accumulation_steps': 8, 'mixed_precision': False}
+        },
+        'low_end_gpu': {
+            'model': {
+                'text_encoder': {
+                    'vocab_size': 512,
+                    'embedding_dim': 256,
+                    'max_seq_len': 500,
+                    'num_layers': 3,
+                    'num_heads': 4,
+                    'ff_dim': 1024,
+                    'dropout': 0.1
+                },
+                'acoustic_decoder': {
+                    'in_features': 256,
+                    'num_layers': 3,
+                    'num_heads': 4,
+                    'ff_dim': 1024,
+                    'out_features': 80,
+                    'dropout': 0.1
+                },
+                'duration_predictor': {'in_features': 256, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5},
+                'pitch_predictor': {'in_features': 256, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5},
+                'energy_predictor': {'in_features': 256, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5}
+            },
+            'training': {'batch_size': 8, 'gradient_accumulation_steps': 4, 'mixed_precision': True}
+        },
+        'mid_gpu': {
+            'model': {
+                'text_encoder': {
+                    'vocab_size': 512,
+                    'embedding_dim': 384,
+                    'max_seq_len': 500,
+                    'num_layers': 4,
+                    'num_heads': 6,
+                    'ff_dim': 1536,
+                    'dropout': 0.1
+                },
+                'acoustic_decoder': {
+                    'in_features': 384,
+                    'num_layers': 4,
+                    'num_heads': 6,
+                    'ff_dim': 1536,
+                    'out_features': 80,
+                    'dropout': 0.1
+                },
+                'duration_predictor': {'in_features': 384, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5},
+                'pitch_predictor': {'in_features': 384, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5},
+                'energy_predictor': {'in_features': 384, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5}
+            },
+            'training': {'batch_size': 16, 'gradient_accumulation_steps': 2, 'mixed_precision': True}
+        },
+        'high_gpu': {
+            'model': {
+                'text_encoder': {
+                    'vocab_size': 512,
+                    'embedding_dim': 512,
+                    'max_seq_len': 500,
+                    'num_layers': 6,
+                    'num_heads': 8,
+                    'ff_dim': 2048,
+                    'dropout': 0.1
+                },
+                'acoustic_decoder': {
+                    'in_features': 512,
+                    'num_layers': 6,
+                    'num_heads': 8,
+                    'ff_dim': 2048,
+                    'out_features': 80,
+                    'dropout': 0.1
+                },
+                'duration_predictor': {'in_features': 512, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5},
+                'pitch_predictor': {'in_features': 512, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5},
+                'energy_predictor': {'in_features': 512, 'out_features': 1, 'num_layers': 2, 'kernel_size': 3, 'dropout': 0.5}
+            },
+            'training': {'batch_size': 32, 'gradient_accumulation_steps': 1, 'mixed_precision': True}
+        }
+    }
+    
+    if hardware == 'auto':
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0).lower()
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            
+            if vram_gb < 4 or any(x in gpu_name for x in ['1050', '1060', 'mx', 'gt']):
+                print(f"Auto-detected low-end GPU: {gpu_name} ({vram_gb:.1f}GB VRAM)")
+                return configs['low_end_gpu']
+            elif vram_gb < 8:
+                print(f"Auto-detected mid-range GPU: {gpu_name} ({vram_gb:.1f}GB VRAM)")
+                return configs['mid_gpu']
+            else:
+                print(f"Auto-detected high-end GPU: {gpu_name} ({vram_gb:.1f}GB VRAM)")
+                return configs['high_gpu']
+        else:
+            print("No GPU detected, using CPU-optimized configuration")
+            return configs['cpu']
+    
+    if hardware not in configs:
+        raise ValueError(f"Unknown hardware type: {hardware}. Choose from: {list(configs.keys())}")
+    
+    return configs[hardware]
+
+
 if __name__ == '__main__':
     # Test model creation
     import yaml
@@ -561,3 +700,9 @@ if __name__ == '__main__':
     print("Model test passed!")
     print(f"Mel output shape: {outputs['mel_output'].shape}")
     print(f"Duration predictions shape: {outputs['pred_durations'].shape}")
+    
+    # Test hardware auto-detection
+    print("\nTesting hardware auto-detection:")
+    hw_config = get_hardware_optimized_config('auto')
+    print(f"Selected config batch size: {hw_config['training']['batch_size']}")
+    print(f"Gradient accumulation steps: {hw_config['training']['gradient_accumulation_steps']}")
