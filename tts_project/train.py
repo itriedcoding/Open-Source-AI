@@ -1,6 +1,7 @@
 """
 Training script for Custom TTS Model.
-Supports mixed precision, distributed training, and checkpointing.
+Supports mixed precision, distributed training, gradient accumulation, and low-end hardware optimization.
+Optimized for CPU, low-end GPUs (2GB VRAM), mid-range, and high-end GPUs.
 """
 
 import os
@@ -19,7 +20,7 @@ from tqdm import tqdm
 import yaml
 import numpy as np
 
-from models.tts_model import create_model
+from models.tts_model import create_model, get_hardware_optimized_config
 from utils.logger import TrainingLogger
 from utils.loss import TTSLoss
 
@@ -127,13 +128,18 @@ class NoamLR:
 
 def train_epoch(model, dataloader, criterion, optimizer, scheduler, 
                 device, epoch, config, scaler, logger):
-    """Train for one epoch."""
+    """Train for one epoch with gradient accumulation support for low-end hardware."""
     model.train()
     total_loss = 0.0
     total_mel_loss = 0.0
     total_dur_loss = 0.0
     total_pitch_loss = 0.0
     total_energy_loss = 0.0
+    
+    # Gradient accumulation settings
+    accum_steps = config['training'].get('gradient_accumulation_steps', 1)
+    effective_batch_size = config['training']['batch_size'] * accum_steps
+    print(f"Using gradient accumulation: {accum_steps} steps (effective batch size: {effective_batch_size})")
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
@@ -146,11 +152,8 @@ def train_epoch(model, dataloader, criterion, optimizer, scheduler,
         durations = batch['durations'].to(device)
         text_lengths = batch['text_lengths'].to(device)
         
-        # Zero gradients
-        optimizer.zero_grad()
-        
         # Forward pass with mixed precision
-        with autocast(enabled=config['training']['mixed_precision']):
+        with autocast(enabled=config['training']['mixed_precision'] and device.type == 'cuda'):
             outputs = model(
                 text, text_lengths,
                 mel_spec, pitch, energy, durations
@@ -158,25 +161,31 @@ def train_epoch(model, dataloader, criterion, optimizer, scheduler,
             
             # Calculate losses
             loss_dict = criterion(outputs)
-            total_batch_loss = loss_dict['total_loss']
+            # Scale loss by accumulation steps
+            scaled_loss = loss_dict['total_loss'] / accum_steps
         
         # Backward pass with gradient scaling
-        scaler.scale(total_batch_loss).backward()
+        scaler.scale(scaled_loss).backward()
         
-        # Gradient clipping
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), 
-            config['training']['clip_grad_norm']
-        )
-        
-        # Optimizer step
-        scaler.step(optimizer)
-        scaler.update()
-        
-        # Learning rate schedule
-        if scheduler is not None:
-            scheduler.step()
+        # Only update weights after accum_steps batches
+        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
+            # Gradient clipping
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), 
+                config['training']['clip_grad_norm']
+            )
+            
+            # Optimizer step
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # Zero gradients after update
+            optimizer.zero_grad()
+            
+            # Learning rate schedule
+            if scheduler is not None:
+                scheduler.step()
         
         # Update statistics
         total_loss += loss_dict['total_loss'].item()
@@ -308,12 +317,28 @@ def main():
                        help='Path to processed dataset')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (cuda or cpu)')
+    parser.add_argument('--hardware', type=str, default='auto',
+                       choices=['cpu', 'low_end_gpu', 'mid_gpu', 'high_gpu', 'auto'],
+                       help='Hardware optimization preset (default: auto-detect)')
     
     args = parser.parse_args()
     
-    # Load configuration
+    # Load base configuration
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # Apply hardware-optimized configuration if requested
+    if args.hardware != 'manual':
+        hw_config = get_hardware_optimized_config(args.hardware)
+        # Merge hardware config with base config
+        config['model'].update(hw_config['model'])
+        config['training']['batch_size'] = hw_config['training']['batch_size']
+        config['training']['gradient_accumulation_steps'] = hw_config['training']['gradient_accumulation_steps']
+        config['training']['mixed_precision'] = hw_config['training']['mixed_precision']
+        print(f"Applied {args.hardware} hardware optimization")
+        print(f"  - Batch size: {config['training']['batch_size']}")
+        print(f"  - Gradient accumulation: {config['training']['gradient_accumulation_steps']}")
+        print(f"  - Mixed precision: {config['training']['mixed_precision']}")
     
     # Set device
     if args.device:
