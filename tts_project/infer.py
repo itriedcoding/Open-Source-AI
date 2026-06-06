@@ -189,6 +189,108 @@ class TTSInference:
             audio_paths.append(save_path)
         
         return audio_paths
+    
+    @torch.no_grad()
+    def synthesize_long_form(self, text: str, speed_factor: float = 1.0,
+                            save_path: Optional[str] = None,
+                            chunk_size: int = 30,
+                            crossfade_length: float = 0.1) -> Dict:
+        """
+        Synthesize long-form speech by chunking text and crossfading.
+        
+        Args:
+            text: Long input text to synthesize
+            speed_factor: Speech speed adjustment
+            save_path: Path to save generated audio
+            chunk_size: Maximum chunk duration in seconds
+            crossfade_length: Crossfade length between chunks in seconds
+        
+        Returns:
+            Dictionary containing audio and metadata
+        """
+        import re
+        
+        # Split text into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        print(f"Split text into {len(sentences)} sentences for chunking")
+        
+        # Group sentences into chunks based on estimated duration
+        # Rough estimate: 150 words per minute = 2.5 words per second
+        words_per_second = 2.5 / speed_factor
+        chunks = []
+        current_chunk = []
+        current_word_count = 0
+        target_words = int(chunk_size * words_per_second)
+        
+        for sentence in sentences:
+            words_in_sentence = len(sentence.split())
+            
+            if current_word_count + words_in_sentence > target_words and current_chunk:
+                # Save current chunk and start new one
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [sentence]
+                current_word_count = words_in_sentence
+            else:
+                current_chunk.append(sentence)
+                current_word_count += words_in_sentence
+        
+        # Add final chunk
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        print(f"Created {len(chunks)} audio chunks")
+        
+        # Synthesize each chunk
+        audio_chunks = []
+        for i, chunk_text in enumerate(tqdm(chunks, desc="Synthesizing chunks")):
+            result = self.synthesize(chunk_text, speed_factor, save_path=None)
+            audio_chunks.append(result['audio'])
+        
+        # Crossfade and concatenate chunks
+        sample_rate = self.config['audio']['sample_rate']
+        crossfade_samples = int(crossfade_length * sample_rate)
+        
+        final_audio = audio_chunks[0]
+        
+        for i in range(1, len(audio_chunks)):
+            chunk = audio_chunks[i]
+            
+            # Create overlap region
+            if len(final_audio) > crossfade_samples and len(chunk) > crossfade_samples:
+                # Apply crossfade
+                fade_out = np.linspace(1, 0, crossfade_samples)
+                fade_in = np.linspace(0, 1, crossfade_samples)
+                
+                # Overlap-add with crossfade
+                overlap_region = (final_audio[-crossfade_samples:] * fade_out + 
+                                 chunk[:crossfade_samples] * fade_in)
+                
+                # Combine
+                final_audio = np.concatenate([
+                    final_audio[:-crossfade_samples],
+                    overlap_region,
+                    chunk[crossfade_samples:]
+                ])
+            else:
+                # Simple concatenation if chunks are too short
+                final_audio = np.concatenate([final_audio, chunk])
+        
+        # Normalize final audio
+        final_audio = final_audio / np.max(np.abs(final_audio))
+        
+        # Save if path provided
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            sf.write(save_path, final_audio, sample_rate)
+            print(f"Saved long-form audio to {save_path}")
+        
+        return {
+            'text': text,
+            'audio': final_audio,
+            'sample_rate': sample_rate,
+            'duration': len(final_audio) / sample_rate,
+            'num_chunks': len(chunks)
+        }
 
 
 def main():
@@ -205,6 +307,14 @@ def main():
                        help='Speech speed factor (default: 1.0)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (cuda or cpu)')
+    parser.add_argument('--long_form', action='store_true',
+                       help='Enable long-form synthesis with automatic chunking')
+    parser.add_argument('--chunk_size', type=int, default=30,
+                       help='Chunk size in seconds for long-form synthesis (default: 30)')
+    parser.add_argument('--crossfade_length', type=float, default=0.1,
+                       help='Crossfade length in seconds between chunks (default: 0.1)')
+    parser.add_argument('--input_file', type=str, default=None,
+                       help='Input text file (one sentence per line). If provided, --text is ignored.')
     
     args = parser.parse_args()
     
@@ -215,13 +325,37 @@ def main():
         device=args.device
     )
     
+    # Handle input file
+    if args.input_file:
+        with open(args.input_file, 'r', encoding='utf-8') as f:
+            texts = [line.strip() for line in f if line.strip()]
+        print(f"Loaded {len(texts)} texts from {args.input_file}")
+        
+        # Synthesize batch
+        output_dir = os.path.dirname(args.output) or '.'
+        audio_paths = tts.synthesize_batch(texts, output_dir, args.speed)
+        print(f"Generated {len(audio_paths)} audio files in {output_dir}")
+        return
+    
     # Synthesize speech
     print(f"Synthesizing: '{args.text}'")
-    result = tts.synthesize(
-        args.text,
-        speed_factor=args.speed,
-        save_path=args.output
-    )
+    
+    if args.long_form:
+        # Long-form synthesis with chunking
+        result = tts.synthesize_long_form(
+            args.text,
+            speed_factor=args.speed,
+            save_path=args.output,
+            chunk_size=args.chunk_size,
+            crossfade_length=args.crossfade_length
+        )
+    else:
+        # Standard synthesis
+        result = tts.synthesize(
+            args.text,
+            speed_factor=args.speed,
+            save_path=args.output
+        )
     
     print(f"Generated audio duration: {result['duration']:.2f}s")
     print(f"Audio saved to: {args.output}")
