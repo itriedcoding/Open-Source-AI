@@ -1,0 +1,77 @@
+# Model Configuration - Custom TTS System
+# Adjust these parameters based on your hardware and dataset
+
+model:
+  # Architecture settings
+  encoder_layers: 6
+  decoder_layers: 6
+  hidden_dim: 256
+  attention_heads: 4
+  dropout: 0.1
+  
+  # Speaker embedding (set to 0 for single speaker)
+  num_speakers: 1
+  speaker_embedding_dim: 128
+  
+  # Duration/Pitch/Energy predictors
+  duration_predictor_hidden: 256
+  pitch_predictor_hidden: 256
+  energy_predictor_hidden: 256
+
+audio:
+  # Audio processing parameters
+  sample_rate: 22050
+  n_mel_channels: 80
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  fmin: 0
+  fmax: 8000
+  
+  # Normalization
+  max_wav_value: 32768.0
+  mel_min: -11.512925464970229
+  mel_max: -2.302585092994046
+
+training:
+  # Hardware optimization (auto, cpu, low_end_gpu, mid_gpu, high_gpu)
+  hardware: auto
+  
+  # Batch settings (will be overridden by hardware detection if set to auto)
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  
+  # Training schedule
+  epochs: 100
+  warmup_steps: 4000
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  
+  # Mixed precision training (saves VRAM)
+  use_mixed_precision: true
+  
+  # Checkpointing
+  save_every_epochs: 5
+  log_every_steps: 100
+
+data:
+  # Dataset paths
+  raw_data_dir: "data/raw"
+  processed_data_dir: "data/processed"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  
+  # Text processing
+  max_text_length: 400
+  max_audio_length: 20.0  # seconds
+  
+inference:
+  # Generation settings
+  speed_factor: 1.0
+  pitch_factor: 1.0
+  energy_factor: 1.0
+  
+  # Long-form synthesis
+  chunk_overlap: 0.1  # seconds for crossfade
+  max_chunk_length: 30.0  # seconds per chunk

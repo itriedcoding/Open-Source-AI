@@ -4,26 +4,26 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
-# Dependencies
-.venv/
-venv/
+.Python
 env/
-.env
-.env.local
-.env.*
+venv/
+.venv/
+.ENV
+.ENV.local
 
 # Logs
 *.log
 
-# Editor/IDE
+# Environment
+.env
+.env.local
+*.env.*
+
+# IDE
 .vscode/
 .idea/
-*.swp
-*.swo
-*.tmp
 
-# Build/dist
-dist/
+# Build artifacts
 build/
+dist/
 ```

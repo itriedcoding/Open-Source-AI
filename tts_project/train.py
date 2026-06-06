@@ -1,114 +1,100 @@
 """
-Training script for Custom TTS Model.
-Supports mixed precision, distributed training, gradient accumulation, and low-end hardware optimization.
-Optimized for CPU, low-end GPUs (2GB VRAM), mid-range, and high-end GPUs.
+Training Script for Custom TTS Model
+Supports CPU, low-end GPU, and high-end GPU with automatic optimization
+Includes gradient accumulation, mixed precision, and checkpointing
 """
 
 import os
-import argparse
-import json
-import time
-from pathlib import Path
-from typing import Dict, Optional
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.cuda.amp import GradScaler, autocast
-from tqdm import tqdm
 import yaml
+import argparse
+import json
+from pathlib import Path
+from tqdm import tqdm
 import numpy as np
 
-from models.tts_model import create_model, get_hardware_optimized_config
-from utils.logger import TrainingLogger
-from utils.loss import TTSLoss
+from models import CustomTTSModel, get_hardware_config
 
 
 class TTSDataset(Dataset):
-    """Dataset for TTS training."""
+    """Dataset for TTS training"""
     
-    def __init__(self, metadata_path: str, feature_dir: str):
-        with open(metadata_path, 'r') as f:
-            self.samples = json.load(f)
-        self.feature_dir = feature_dir
+    def __init__(self, metadata_file, processed_dir):
+        with open(metadata_file, 'r') as f:
+            self.metadata = json.load(f)
+        
+        self.processed_dir = Path(processed_dir)
     
     def __len__(self):
-        return len(self.samples)
+        return len(self.metadata)
     
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        feature_path = sample['feature_path']
+        item = self.metadata[idx]
+        feature_path = self.processed_dir / item['feature_file']
         
-        # Load features
-        features = np.load(feature_path, allow_pickle=True).item()
-        
-        text_sequence = torch.tensor(features['text_sequence'], dtype=torch.long)
-        mel_spec = torch.tensor(features['mel_spec'], dtype=torch.float32)
-        pitch = torch.tensor(features['pitch'], dtype=torch.float32)
-        energy = torch.tensor(features['energy'], dtype=torch.float32)
-        
-        # Calculate durations from mel spectrogram and text lengths
-        text_len = len(text_sequence)
-        mel_len = len(mel_spec)
-        
-        # Simple duration calculation (can be improved with forced alignment)
-        avg_duration = mel_len / text_len
-        durations = torch.full((text_len,), avg_duration)
+        data = torch.load(feature_path, map_location='cpu')
         
         return {
-            'text': text_sequence,
-            'mel_spec': mel_spec,
-            'pitch': pitch,
-            'energy': energy,
-            'durations': durations,
-            'text_length': text_len,
-            'mel_length': mel_len
+            'tokens': data['tokens'],
+            'mel': data['mel'],
+            'pitch': data['pitch'],
+            'energy': data['energy'],
+            'duration': data['duration']
         }
 
 
 def collate_fn(batch):
-    """Collate function for DataLoader."""
-    # Find max lengths
-    max_text_len = max(item['text_length'] for item in batch)
-    max_mel_len = max(item['mel_length'] for item in batch)
+    """Collate function for batching with padding"""
+    max_token_len = max(len(item['tokens']) for item in batch)
+    max_mel_len = max(item['mel'].shape[0] for item in batch)
     
-    # Initialize tensors
-    batch_size = len(batch)
-    text_padded = torch.zeros(batch_size, max_text_len, dtype=torch.long)
-    mel_padded = torch.zeros(batch_size, max_mel_len, batch[0]['mel_spec'].size(-1))
-    pitch_padded = torch.zeros(batch_size, max_mel_len)
-    energy_padded = torch.zeros(batch_size, max_mel_len)
-    durations_padded = torch.zeros(batch_size, max_text_len, dtype=torch.float32)
-    text_lengths = torch.zeros(batch_size, dtype=torch.long)
-    mel_lengths = torch.zeros(batch_size, dtype=torch.long)
+    tokens_padded = []
+    mel_padded = []
+    pitch_list = []
+    energy_list = []
+    durations_list = []
+    token_lengths = []
+    mel_lengths = []
     
-    # Fill tensors
-    for i, item in enumerate(batch):
-        text_len = item['text_length']
-        mel_len = item['mel_length']
+    for item in batch:
+        # Pad tokens
+        tokens = item['tokens']
+        padding = torch.zeros(max_token_len - len(tokens), dtype=tokens.dtype)
+        tokens_padded.append(torch.cat([tokens, padding]))
+        token_lengths.append(len(tokens))
         
-        text_padded[i, :text_len] = item['text']
-        mel_padded[i, :mel_len] = item['mel_spec']
-        pitch_padded[i, :mel_len] = item['pitch']
-        energy_padded[i, :mel_len] = item['energy']
-        durations_padded[i, :text_len] = item['durations'].float()
-        text_lengths[i] = text_len
-        mel_lengths[i] = mel_len
+        # Pad mel spectrogram
+        mel = item['mel']
+        mel_pad = torch.zeros(max_mel_len - mel.shape[0], mel.shape[1])
+        mel_padded.append(torch.cat([mel, mel_pad], dim=0))
+        mel_lengths.append(mel.shape[0])
+        
+        # Pad pitch and energy
+        pitch = item['pitch']
+        energy = item['energy']
+        min_len = min(len(pitch), len(energy), mel.shape[0])
+        
+        pitch_list.append(pitch[:min_len])
+        energy_list.append(energy[:min_len])
+        durations_list.append(torch.ones(min_len))  # Simplified duration
     
     return {
-        'text': text_padded,
-        'mel_spec': mel_padded,
-        'pitch': pitch_padded,
-        'energy': energy_padded,
-        'durations': durations_padded,
-        'text_lengths': text_lengths,
-        'mel_lengths': mel_lengths
+        'tokens': torch.stack(tokens_padded),
+        'mel': torch.stack(mel_padded),
+        'pitch': torch.stack(pitch_list),
+        'energy': torch.stack(energy_list),
+        'durations': torch.stack(durations_list),
+        'token_lengths': torch.tensor(token_lengths),
+        'mel_lengths': torch.tensor(mel_lengths)
     }
 
 
-class NoamLR:
-    """Noam learning rate scheduler."""
+class NoamScheduler:
+    """Noam learning rate scheduler"""
     
     def __init__(self, optimizer, model_size, warmup_steps):
         self.optimizer = optimizer
@@ -122,367 +108,388 @@ class NoamLR:
             self.step_num ** (-0.5),
             self.step_num * self.warmup_steps ** (-1.5)
         )
+        
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
+        
+        return lr
 
 
-def train_epoch(model, dataloader, criterion, optimizer, scheduler, 
-                device, epoch, config, scaler, logger):
-    """Train for one epoch with gradient accumulation support for low-end hardware."""
+def train_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
+                grad_scaler, config, epoch):
+    """Single training epoch"""
     model.train()
-    total_loss = 0.0
-    total_mel_loss = 0.0
-    total_dur_loss = 0.0
-    total_pitch_loss = 0.0
-    total_energy_loss = 0.0
+    total_loss = 0
+    total_mel_loss = 0
+    total_duration_loss = 0
     
-    # Gradient accumulation settings
-    accum_steps = config['training'].get('gradient_accumulation_steps', 1)
-    effective_batch_size = config['training']['batch_size'] * accum_steps
-    print(f"Using gradient accumulation: {accum_steps} steps (effective batch size: {effective_batch_size})")
+    training_cfg = config.get('training', {})
+    use_amp = training_cfg.get('use_mixed_precision', True)
+    accum_steps = training_cfg.get('gradient_accumulation_steps', 1)
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
     
+    optimizer.zero_grad()
+    
     for batch_idx, batch in enumerate(pbar):
-        # Move data to device
-        text = batch['text'].to(device)
-        mel_spec = batch['mel_spec'].to(device)
-        pitch = batch['pitch'].to(device)
-        energy = batch['energy'].to(device)
+        # Move to device
+        tokens = batch['tokens'].to(device)
+        mel_targets = batch['mel'].to(device)
+        token_lengths = batch['token_lengths'].to(device)
+        mel_lengths = batch['mel_lengths'].to(device)
+        pitches = batch['pitch'].to(device)
+        energies = batch['energy'].to(device)
         durations = batch['durations'].to(device)
-        text_lengths = batch['text_lengths'].to(device)
         
         # Forward pass with mixed precision
-        with autocast(enabled=config['training']['mixed_precision'] and device.type == 'cuda'):
-            outputs = model(
-                text, text_lengths,
-                mel_spec, pitch, energy, durations
+        if use_amp and device.type == 'cuda':
+            with autocast():
+                output = model(
+                    tokens, token_lengths, mel_targets, mel_lengths,
+                    pitches=pitches, energies=energies, durations=durations
+                )
+                
+                # Calculate losses
+                mel_loss = criterion['mel'](
+                    output['mel_output'][~output['mel_mask']], 
+                    mel_targets[~output['mel_mask']]
+                )
+                
+                duration_loss = criterion['duration'](
+                    output['duration_pred'], 
+                    durations
+                )
+                
+                loss = mel_loss + 0.1 * duration_loss
+                loss = loss / accum_steps
+            
+            # Backward pass with gradient scaling
+            grad_scaler.scale(loss).backward()
+            
+            # Update weights every accum_steps
+            if (batch_idx + 1) % accum_steps == 0:
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+                optimizer.zero_grad()
+                
+                if scheduler is not None:
+                    scheduler.step()
+        else:
+            # Standard training (CPU or no AMP)
+            output = model(
+                tokens, token_lengths, mel_targets, mel_lengths,
+                pitches=pitches, energies=energies, durations=durations
             )
             
             # Calculate losses
-            loss_dict = criterion(outputs)
-            # Scale loss by accumulation steps
-            scaled_loss = loss_dict['total_loss'] / accum_steps
-        
-        # Backward pass with gradient scaling
-        scaler.scale(scaled_loss).backward()
-        
-        # Only update weights after accum_steps batches
-        if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(dataloader):
-            # Gradient clipping
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 
-                config['training']['clip_grad_norm']
+            mel_loss = criterion['mel'](
+                output['mel_output'][~output['mel_mask']], 
+                mel_targets[~output['mel_mask']]
             )
             
-            # Optimizer step
-            scaler.step(optimizer)
-            scaler.update()
+            duration_loss = criterion['duration'](
+                output['duration_pred'], 
+                durations
+            )
             
-            # Zero gradients after update
-            optimizer.zero_grad()
+            loss = mel_loss + 0.1 * duration_loss
+            loss = loss / accum_steps
             
-            # Learning rate schedule
-            if scheduler is not None:
-                scheduler.step()
+            loss.backward()
+            
+            # Update weights every accum_steps
+            if (batch_idx + 1) % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                if scheduler is not None:
+                    scheduler.step()
         
-        # Update statistics
-        total_loss += loss_dict['total_loss'].item()
-        total_mel_loss += loss_dict.get('mel_loss', 0.0)
-        total_dur_loss += loss_dict.get('duration_loss', 0.0)
-        total_pitch_loss += loss_dict.get('pitch_loss', 0.0)
-        total_energy_loss += loss_dict.get('energy_loss', 0.0)
+        # Track metrics
+        total_loss += loss.item() * accum_steps
+        total_mel_loss += mel_loss.item()
+        total_duration_loss += duration_loss.item()
         
         # Update progress bar
-        if batch_idx % config['logging']['log_interval'] == 0:
-            avg_loss = total_loss / (batch_idx + 1)
+        if batch_idx % 10 == 0:
             pbar.set_postfix({
-                'loss': f'{avg_loss:.4f}',
-                'mel': f'{total_mel_loss/(batch_idx+1):.4f}',
-                'dur': f'{total_dur_loss/(batch_idx+1):.4f}'
+                'loss': f'{total_loss / (batch_idx + 1):.4f}',
+                'mel': f'{total_mel_loss / (batch_idx + 1):.4f}',
+                'dur': f'{total_duration_loss / (batch_idx + 1):.4f}'
             })
-            
-            # Log to tensorboard
-            global_step = epoch * len(dataloader) + batch_idx
-            logger.log_scalar('train/total_loss', avg_loss, global_step)
-            logger.log_scalar('train/mel_loss', total_mel_loss/(batch_idx+1), global_step)
-            logger.log_scalar('train/duration_loss', total_dur_loss/(batch_idx+1), global_step)
     
-    # Return average losses
-    num_batches = len(dataloader)
-    return {
-        'total_loss': total_loss / num_batches,
-        'mel_loss': total_mel_loss / num_batches,
-        'duration_loss': total_dur_loss / num_batches,
-        'pitch_loss': total_pitch_loss / num_batches,
-        'energy_loss': total_energy_loss / num_batches
-    }
+    avg_loss = total_loss / len(dataloader)
+    avg_mel_loss = total_mel_loss / len(dataloader)
+    avg_duration_loss = total_duration_loss / len(dataloader)
+    
+    return avg_loss, avg_mel_loss, avg_duration_loss
 
 
-def validate(model, dataloader, criterion, device, epoch, config, logger):
-    """Validate the model."""
+def validate(model, dataloader, criterion, device, config):
+    """Validation epoch"""
     model.eval()
-    total_loss = 0.0
-    total_mel_loss = 0.0
-    total_dur_loss = 0.0
-    total_pitch_loss = 0.0
-    total_energy_loss = 0.0
+    total_loss = 0
+    total_mel_loss = 0
+    
+    training_cfg = config.get('training', {})
+    use_amp = training_cfg.get('use_mixed_precision', True)
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validation"):
-            # Move data to device
-            text = batch['text'].to(device)
-            mel_spec = batch['mel_spec'].to(device)
-            pitch = batch['pitch'].to(device)
-            energy = batch['energy'].to(device)
+        for batch in tqdm(dataloader, desc="Validating"):
+            tokens = batch['tokens'].to(device)
+            mel_targets = batch['mel'].to(device)
+            token_lengths = batch['token_lengths'].to(device)
+            mel_lengths = batch['mel_lengths'].to(device)
+            pitches = batch['pitch'].to(device)
+            energies = batch['energy'].to(device)
             durations = batch['durations'].to(device)
-            text_lengths = batch['text_lengths'].to(device)
             
-            # Forward pass
-            outputs = model(
-                text, text_lengths,
-                mel_spec, pitch, energy, durations
-            )
+            if use_amp and device.type == 'cuda':
+                with autocast():
+                    output = model(
+                        tokens, token_lengths, mel_targets, mel_lengths,
+                        pitches=pitches, energies=energies, durations=durations
+                    )
+                    
+                    mel_loss = criterion['mel'](
+                        output['mel_output'][~output['mel_mask']], 
+                        mel_targets[~output['mel_mask']]
+                    )
+                    
+                    duration_loss = criterion['duration'](
+                        output['duration_pred'], 
+                        durations
+                    )
+                    
+                    loss = mel_loss + 0.1 * duration_loss
+            else:
+                output = model(
+                    tokens, token_lengths, mel_targets, mel_lengths,
+                    pitches=pitches, energies=energies, durations=durations
+                )
+                
+                mel_loss = criterion['mel'](
+                    output['mel_output'][~output['mel_mask']], 
+                    mel_targets[~output['mel_mask']]
+                )
+                
+                duration_loss = criterion['duration'](
+                    output['duration_pred'], 
+                    durations
+                )
+                
+                loss = mel_loss + 0.1 * duration_loss
             
-            # Calculate losses
-            loss_dict = criterion(outputs)
-            
-            total_loss += loss_dict['total_loss'].item()
-            total_mel_loss += loss_dict.get('mel_loss', 0.0)
-            total_dur_loss += loss_dict.get('duration_loss', 0.0)
-            total_pitch_loss += loss_dict.get('pitch_loss', 0.0)
-            total_energy_loss += loss_dict.get('energy_loss', 0.0)
+            total_loss += loss.item()
+            total_mel_loss += mel_loss.item()
     
-    # Return average losses
-    num_batches = len(dataloader)
-    metrics = {
-        'total_loss': total_loss / num_batches,
-        'mel_loss': total_mel_loss / num_batches,
-        'duration_loss': total_dur_loss / num_batches,
-        'pitch_loss': total_pitch_loss / num_batches,
-        'energy_loss': total_energy_loss / num_batches
-    }
+    avg_loss = total_loss / len(dataloader)
+    avg_mel_loss = total_mel_loss / len(dataloader)
     
-    # Log to tensorboard
-    global_step = epoch * len(dataloader)
-    logger.log_scalar('val/total_loss', metrics['total_loss'], global_step)
-    logger.log_scalar('val/mel_loss', metrics['mel_loss'], global_step)
-    
-    return metrics
-
-
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, config, filename='checkpoint.pt'):
-    """Save model checkpoint."""
-    checkpoint_dir = config['logging']['checkpoint_dir']
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-        'config': config
-    }
-    
-    if scheduler is not None:
-        checkpoint['scheduler_state_dict'] = scheduler.optimizer.state_dict()
-    
-    torch.save(checkpoint, os.path.join(checkpoint_dir, filename))
-
-
-def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
-    """Load model checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        scheduler.optimizer.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    start_epoch = checkpoint['epoch']
-    best_loss = checkpoint.get('loss', float('inf'))
-    
-    return model, optimizer, scheduler, start_epoch, best_loss
+    return avg_loss, avg_mel_loss
 
 
 def main():
     parser = argparse.ArgumentParser(description='Train Custom TTS Model')
-    parser.add_argument('--config', type=str, default='configs/model_config.yaml',
+    parser.add_argument('--config', type=str, default='config.yaml',
                        help='Path to configuration file')
+    parser.add_argument('--processed_dir', type=str, default='data/processed',
+                       help='Directory with processed data')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                       help='Directory to save checkpoints')
+    parser.add_argument('--hardware', type=str, default='auto',
+                       choices=['auto', 'cpu', 'low_end_gpu', 'mid_gpu', 'high_gpu'],
+                       help='Hardware type for optimization')
+    parser.add_argument('--epochs', type=int, default=None,
+                       help='Number of epochs (overrides config)')
     parser.add_argument('--resume', type=str, default=None,
                        help='Path to checkpoint to resume from')
-    parser.add_argument('--data_dir', type=str, default='data/processed',
-                       help='Path to processed dataset')
-    parser.add_argument('--device', type=str, default=None,
-                       help='Device to use (cuda or cpu)')
-    parser.add_argument('--hardware', type=str, default='auto',
-                       choices=['cpu', 'low_end_gpu', 'mid_gpu', 'high_gpu', 'auto'],
-                       help='Hardware optimization preset (default: auto-detect)')
     
     args = parser.parse_args()
     
-    # Load base configuration
+    # Load configuration
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Apply hardware-optimized configuration if requested
-    if args.hardware != 'manual':
-        hw_config = get_hardware_optimized_config(args.hardware)
-        # Merge hardware config with base config
+    # Get hardware-specific configuration
+    hw_config = get_hardware_config(args.hardware)
+    
+    # Merge hardware config with base config
+    if 'model' in hw_config:
         config['model'].update(hw_config['model'])
-        config['training']['batch_size'] = hw_config['training']['batch_size']
-        config['training']['gradient_accumulation_steps'] = hw_config['training']['gradient_accumulation_steps']
-        config['training']['mixed_precision'] = hw_config['training']['mixed_precision']
-        print(f"Applied {args.hardware} hardware optimization")
-        print(f"  - Batch size: {config['training']['batch_size']}")
-        print(f"  - Gradient accumulation: {config['training']['gradient_accumulation_steps']}")
-        print(f"  - Mixed precision: {config['training']['mixed_precision']}")
+    if 'training' in hw_config:
+        config['training'].update(hw_config['training'])
     
-    # Set device
-    if args.device:
-        device = torch.device(args.device)
-    elif config['device']['cuda'] and torch.cuda.is_available():
-        device = torch.device(f'cuda:{config["device"]["gpu_ids"][0]}')
-    else:
+    print(f"\n🔧 Hardware Configuration: {args.hardware}")
+    print(f"   Model hidden dim: {config['model']['hidden_dim']}")
+    print(f"   Encoder layers: {config['model']['encoder_layers']}")
+    print(f"   Decoder layers: {config['model']['decoder_layers']}")
+    print(f"   Batch size: {config['training']['batch_size']}")
+    print(f"   Gradient accumulation: {config['training']['gradient_accumulation_steps']}")
+    print(f"   Mixed precision: {config['training']['use_mixed_precision']}")
+    
+    # Setup device
+    if args.hardware == 'cpu' or not torch.cuda.is_available():
         device = torch.device('cpu')
+        print("\n💻 Using CPU for training")
+    else:
+        device = torch.device('cuda')
+        print(f"\n🚀 Using GPU: {torch.cuda.get_device_name(0)}")
+        print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
-    print(f"Using device: {device}")
+    # Create checkpoint directory
+    checkpoint_path = Path(args.checkpoint_dir)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
     
-    # Create datasets
-    train_dataset = TTSDataset(
-        os.path.join(args.data_dir, 'train_metadata.json'),
-        os.path.join(args.data_dir, 'features')
-    )
-    val_dataset = TTSDataset(
-        os.path.join(args.data_dir, 'val_metadata.json'),
-        os.path.join(args.data_dir, 'features')
-    )
+    # Load vocabulary size from processed data
+    vocab_file = Path(args.processed_dir) / 'vocab.json'
+    if vocab_file.exists():
+        with open(vocab_file, 'r') as f:
+            vocab_info = json.load(f)
+        config['vocab_size'] = vocab_info['vocab_size']
+        print(f"\n📚 Vocabulary size: {config['vocab_size']}")
+    else:
+        print("\n⚠️  Warning: vocab.json not found. Using default vocab_size=100")
+        config['vocab_size'] = 100
     
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=config['device']['num_workers'],
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=False,
-        collate_fn=collate_fn,
-        num_workers=config['device']['num_workers'],
-        pin_memory=True
-    )
-    
-    # Create model
-    model = create_model(config).to(device)
+    # Initialize model
+    model = CustomTTSModel(config)
+    model = model.to(device)
     
     # Count parameters
-    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: {num_params:,}")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n📊 Model Parameters:")
+    print(f"   Total: {total_params:,}")
+    print(f"   Trainable: {trainable_params:,}")
     
-    # Create loss function
-    criterion = TTSLoss(config)
+    # Initialize datasets
+    processed_path = Path(args.processed_dir)
+    train_dataset = TTSDataset(processed_path / 'train_metadata.json', processed_path)
+    val_dataset = TTSDataset(processed_path / 'val_metadata.json', processed_path)
     
-    # Create optimizer
-    if config['optimizer']['type'] == 'adamw':
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=config['training']['learning_rate'],
-            betas=tuple(config['optimizer']['betas']),
-            eps=config['optimizer']['eps'],
-            weight_decay=config['training']['weight_decay']
-        )
-    else:
-        optimizer = optim.Adam(
-            model.parameters(),
-            lr=config['training']['learning_rate'],
-            betas=tuple(config['optimizer']['betas']),
-            eps=config['optimizer']['eps']
-        )
+    print(f"\n📁 Dataset sizes:")
+    print(f"   Train: {len(train_dataset)} samples")
+    print(f"   Val: {len(val_dataset)} samples")
     
-    # Create learning rate scheduler
-    scheduler = None
-    if config['training']['lr_scheduler'] == 'noam':
-        scheduler = NoamLR(
-            optimizer,
-            model_size=config['model']['text_encoder']['embedding_dim'],
-            warmup_steps=config['training']['warmup_steps']
-        )
+    # Create dataloaders
+    batch_size = config['training']['batch_size']
     
-    # Create gradient scaler for mixed precision
-    scaler = GradScaler(enabled=config['training']['mixed_precision'])
-    
-    # Create logger
-    logger = TrainingLogger(config['logging']['tensorboard_dir'])
-    
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    best_val_loss = float('inf')
-    
-    if args.resume:
-        print(f"Resuming from checkpoint: {args.resume}")
-        model, optimizer, scheduler, start_epoch, best_val_loss = load_checkpoint(
-            model, optimizer, scheduler, args.resume, device
-        )
-        print(f"Resumed from epoch {start_epoch} with best loss {best_val_loss:.4f}")
-    
-    # Training loop
-    print("Starting training...")
-    
-    for epoch in range(start_epoch, config['training']['num_epochs']):
-        start_time = time.time()
-        
-        # Train
-        train_metrics = train_epoch(
-            model, train_loader, criterion, optimizer, scheduler,
-            device, epoch, config, scaler, logger
-        )
-        
-        # Validate
-        val_metrics = validate(
-            model, val_loader, criterion, device, epoch, config, logger
-        )
-        
-        epoch_time = time.time() - start_time
-        
-        # Print epoch summary
-        print(f"\nEpoch {epoch + 1}/{config['training']['num_epochs']}")
-        print(f"Time: {epoch_time:.2f}s")
-        print(f"Train Loss: {train_metrics['total_loss']:.4f}")
-        print(f"Val Loss: {val_metrics['total_loss']:.4f}")
-        
-        # Save best model
-        if val_metrics['total_loss'] < best_val_loss:
-            best_val_loss = val_metrics['total_loss']
-            save_checkpoint(
-                model, optimizer, scheduler, epoch, val_metrics['total_loss'],
-                config, 'best_model.pt'
-            )
-            print(f"Saved new best model with loss {best_val_loss:.4f}")
-        
-        # Save regular checkpoint
-        if (epoch + 1) % config['logging']['save_interval'] == 0:
-            save_checkpoint(
-                model, optimizer, scheduler, epoch, val_metrics['total_loss'],
-                config, f'checkpoint_epoch_{epoch + 1}.pt'
-            )
-    
-    # Save final model
-    save_checkpoint(
-        model, optimizer, scheduler, config['training']['num_epochs'],
-        val_metrics['total_loss'], config, 'final_model.pt'
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=0,  # Set to >0 for faster loading on Linux
+        pin_memory=device.type == 'cuda'
     )
     
-    print("\nTraining completed!")
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=device.type == 'cuda'
+    )
+    
+    # Initialize loss functions
+    criterion = {
+        'mel': nn.MSELoss(),
+        'duration': nn.MSELoss()
+    }
+    
+    # Initialize optimizer
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=config['training']['learning_rate'],
+        weight_decay=config['training']['weight_decay']
+    )
+    
+    # Initialize scheduler
+    scheduler = NoamScheduler(
+        optimizer,
+        model_size=config['model']['hidden_dim'],
+        warmup_steps=config['training']['warmup_steps']
+    )
+    
+    # Initialize gradient scaler for mixed precision
+    grad_scaler = GradScaler() if config['training']['use_mixed_precision'] else None
+    
+    # Resume from checkpoint if specified
+    start_epoch = 1
+    best_val_loss = float('inf')
+    
+    if args.resume and Path(args.resume).exists():
+        print(f"\n📥 Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        print(f"   Resumed from epoch {start_epoch-1}")
+    
+    # Training loop
+    num_epochs = args.epochs or config['training']['epochs']
+    save_every = config['training'].get('save_every_epochs', 5)
+    
+    print(f"\n🎯 Starting training for {num_epochs} epochs...")
+    print(f"   Checkpoints saved every {save_every} epochs")
+    print(f"   Output directory: {checkpoint_path}")
+    
+    for epoch in range(start_epoch, num_epochs + 1):
+        # Training
+        train_loss, train_mel_loss, train_dur_loss = train_epoch(
+            model, train_loader, criterion, optimizer, scheduler,
+            device, grad_scaler, config, epoch
+        )
+        
+        # Validation
+        val_loss, val_mel_loss = validate(model, val_loader, criterion, device, config)
+        
+        # Print epoch summary
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch}/{num_epochs}")
+        print(f"{'='*60}")
+        print(f"Train Loss: {train_loss:.4f} (Mel: {train_mel_loss:.4f}, Dur: {train_dur_loss:.4f})")
+        print(f"Val Loss:   {val_loss:.4f} (Mel: {val_mel_loss:.4f})")
+        print(f"Learning Rate: {scheduler.optimizer.param_groups[0]['lr']:.6f}")
+        
+        # Save checkpoint
+        if epoch % save_every == 0 or val_loss < best_val_loss:
+            checkpoint_file = checkpoint_path / f'checkpoint_epoch_{epoch}.pt'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': val_loss,
+                'config': config
+            }, checkpoint_file)
+            
+            print(f"✅ Checkpoint saved: {checkpoint_file}")
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_file = checkpoint_path / 'best_model.pt'
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_val_loss': val_loss,
+                    'config': config
+                }, best_model_file)
+                print(f"🏆 New best model saved: {best_model_file}")
+        
+        print()
+    
+    print("\n🎉 Training complete!")
     print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Final checkpoint: {checkpoint_path / f'checkpoint_epoch_{num_epochs}.pt'}")
+    print(f"Best model: {checkpoint_path / 'best_model.pt'}")
 
 
 if __name__ == '__main__':
