@@ -1,0 +1,42 @@
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+htmlcov/
+.coverage.*
+.pytest_cache/
+.mypy_cache/
+
+# Dependencies
+venv/
+.venv/
+.env
+.env.local
+*.env.*
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+```
